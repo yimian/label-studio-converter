@@ -40,6 +40,7 @@ class Format(Enum):
     BRUSH_TO_PNG = 9
     ASR_MANIFEST = 10
     YOLO = 11
+    YM_ABSA = 100  # absa task for yimian
 
     def __str__(self):
         return self.name
@@ -53,7 +54,6 @@ class Format(Enum):
 
 
 class Converter(object):
-
     _FORMAT_INFO = {
         Format.JSON: {
             'title': 'JSON',
@@ -123,13 +123,19 @@ class Converter(object):
                            'format expected by NVIDIA NeMo models.',
             'link': 'https://labelstud.io/guide/export.html#ASR-MANIFEST',
             'tags': ['speech recognition']
+        },
+        Format.YM_ABSA: {
+            'title': 'ABSA for YIMIAN',
+            'description': 'ABSA task for yimian, which is a multi-task bert model including read-comprehension and classification',
+            'link': 'https://github.com/yimian/label-studio-converter',
+            'tags': ['absa']
         }
     }
 
     def all_formats(self):
         return self._FORMAT_INFO
 
-    def __init__(self, config, project_dir, output_tags=None, upload_dir=None):
+    def __init__(self, config, project_dir=None, output_tags=None, upload_dir=None):
         self.project_dir = project_dir
         self.upload_dir = upload_dir
         if isinstance(config, dict):
@@ -148,7 +154,6 @@ class Converter(object):
     def convert(self, input_data, output_data, format, is_dir=True, **kwargs):
         if isinstance(format, str):
             format = Format.from_string(format)
-            
         if format == Format.JSON:
             self.convert_to_json(input_data, output_data, is_dir=is_dir)
         elif format == Format.JSON_MIN:
@@ -185,6 +190,10 @@ class Converter(object):
             convert_to_asr_json_manifest(
                 items, output_data, data_key=self._data_keys[0], project_dir=self.project_dir,
                 upload_dir=self.upload_dir)
+        elif format == Format.YM_ABSA:
+            header = kwargs.get('csv_header', True)
+            sep = kwargs.get('csv_separator', ',')
+            self.convert_to_absa(input_data, output_data, sep=sep, header=header, is_dir=is_dir)
 
     def _get_data_keys_and_output_tags(self, output_tags=None):
         data_keys = set()
@@ -222,7 +231,8 @@ class Converter(object):
         if not ('Image' in input_tag_types and ('RectangleLabels' in output_tag_types or
                                                 'PolygonLabels' in output_tag_types)):
             all_formats.remove(Format.COCO.name)
-        if not ('Image' in input_tag_types and ('BrushLabels' in output_tag_types or 'brushlabels' in output_tag_types)):
+        if not ('Image' in input_tag_types and (
+                'BrushLabels' in output_tag_types or 'brushlabels' in output_tag_types)):
             all_formats.remove(Format.BRUSH_TO_NUMPY.name)
             all_formats.remove(Format.BRUSH_TO_PNG.name)
         if not (('Audio' in input_tag_types or 'AudioPlus' in input_tag_types) and 'TextArea' in output_tag_types):
@@ -269,19 +279,20 @@ class Converter(object):
 
         # get last not skipped completion and make result from it
         annotations = task['annotations'] if 'annotations' in task else task['completions']
-        
+
         # skip cancelled annotations
         cancelled = lambda x: not (x.get('skipped', False) or x.get('was_cancelled', False))
         annotations = list(filter(cancelled, annotations))
         if not annotations:
             return None
-        
+
         # sort by creation time
         annotations = sorted(annotations, key=lambda x: x.get('created_at', 0), reverse=True)
 
         for annotation in annotations:
             inputs = task['data']
-            result = annotation['result']
+            # use convert result for absa task
+            result = annotation['result'] if len(annotation.get('convert_result', [])) == 0 else annotation['convert_result']
             outputs = defaultdict(list)
 
             # get results only as output
@@ -299,7 +310,7 @@ class Converter(object):
                 'id': task['id'],
                 'input': inputs,
                 'output': outputs,
-                'completed_by': annotation.get('completed_by', {}),
+                'completed_by': annotation.get('completed_by', {'user_id': annotation['user_id']}),
                 'annotation_id': annotation.get('id')
             }
 
@@ -308,15 +319,20 @@ class Converter(object):
 
     def _prettify(self, v):
         out = []
-        tag_type = None
         for i in v:
             j = deepcopy(i)
             tag_type = j.pop('type')
             if tag_type == 'Choices' and len(j['choices']) == 1:
-                out.append(j['choices'][0])
+                return j['choices'][0]
+            elif tag_type == 'AbsaLabels':
+                absa_key = 'key' if 'AspectTerm' in j['absalabels'] else 'summary'
+                out.append({
+                    f'label_{absa_key}': j['text'],
+                    f'label_{absa_key}_span': [j['start'], j['end']]
+                })
             else:
                 out.append(j)
-        return out[0] if tag_type == 'Choices' and len(out) == 1 else out
+        return out
 
     def convert_to_json(self, input_data, output_dir, is_dir=True):
         self._check_format(Format.JSON)
@@ -368,6 +384,60 @@ class Converter(object):
                 record[name] = pretty_value if isinstance(pretty_value, str) else json.dumps(pretty_value)
             record['annotator'] = item['completed_by'].get('email')
             record['annotation_id'] = item['annotation_id']
+            records.append(record)
+
+        pd.DataFrame.from_records(records).to_csv(output_file, index=False, **kwargs)
+
+    def convert_to_absa(self, input_data, output_dir, is_dir=True, **kwargs):
+        """
+        absa result format
+        source:
+            {
+                "union_labeltype": [
+                    { 'start': 4, 'end': 8, text: '天使系列', 'asbalabels': ['AspectTerm'], 'type': 'AbsaLabels' },
+                    { 'start': 20, 'end': 25, text: 'E系列更好', 'asbalabels': ['OpinionSummary'], 'type': 'AbsaLabels' }
+                ],
+                "union_choice": [
+                    { 'choices': ['5'], type: 'Choices' }
+                ]
+            }
+        target:
+            {
+                'label_key': '天使系列',
+                'label_key_span': [4, 8],
+                'label_summary': '用E系列更好',
+                'label_summary_span': [20, 25],
+                'label_rating': 5
+            }
+        """
+        self._check_format(Format.YM_ABSA)
+        ensure_dir(output_dir)
+        output_file = os.path.join(output_dir, 'result.csv')
+        records = []
+        item_iterator = self.iter_from_dir if is_dir else self.iter_from_json_file
+
+        for item in item_iterator(input_data):
+            record = deepcopy(item['input'])
+            record.update({
+                'label_key': '',
+                'label_key_span': [],
+                'label_summary': '',
+                'label_summary_span': [],
+                'label_rating': 0,
+            })
+            if item.get('id') is not None:
+                record['id'] = item['id']
+
+            record['annotator'] = item['completed_by'].get('user_id')
+            record['annotation_id'] = item['annotation_id']
+
+            for name, value in item['output'].items():
+                pretty_value = self._prettify(value)
+                if name == 'union_labeltype':
+                    for label_item in pretty_value:
+                        record.update(label_item)
+                else:
+                    record['label_rating'] = pretty_value
             records.append(record)
 
         pd.DataFrame.from_records(records).to_csv(output_file, index=False, **kwargs)
@@ -539,8 +609,8 @@ class Converter(object):
             if len(labels) == 0:
                 logger.error('Empty bboxes.')
                 continue
-            label_path = os.path.join(output_label_dir, os.path.splitext(os.path.basename(image_path))[0]+'.txt')
-            annotations =[]
+            label_path = os.path.join(output_label_dir, os.path.splitext(os.path.basename(image_path))[0] + '.txt')
+            annotations = []
             for label in labels:
                 if 'rectanglelabels' in label:
                     category_name = label['rectanglelabels'][0]
@@ -556,8 +626,8 @@ class Converter(object):
                 category_id = category_name_to_id[category_name]
 
                 if "rectanglelabels" in label:
-                    x = (label['x'] + label['width']/2) / 100
-                    y = (label['y'] + label['height']/2) / 100
+                    x = (label['x'] + label['width'] / 2) / 100
+                    y = (label['y'] + label['height'] / 2) / 100
                     w = label['width'] / 100
                     h = label['height'] / 100
                     annotations.append([category_id, x, y, w, h])
@@ -566,13 +636,13 @@ class Converter(object):
             with open(label_path, 'w') as f:
                 for annotation in annotations:
                     for idx, l in enumerate(annotation):
-                        if idx == len(annotation) -1:
+                        if idx == len(annotation) - 1:
                             f.write(f"{l}\n")
                         else:
                             f.write(f"{l} ")
         with open(class_file, 'w', encoding='utf8') as f:
             for c in categories:
-                f.write(c['name']+'\n')
+                f.write(c['name'] + '\n')
         with io.open(notes_file, mode='w', encoding='utf8') as fout:
             json.dump({
                 'categories': categories,

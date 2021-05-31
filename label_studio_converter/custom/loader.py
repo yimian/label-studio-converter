@@ -27,7 +27,8 @@ class ABSALoader:
                  level_columns=['nlp_level_1', 'nlp_level_2'],
                  keep_columns=['nlp_unique_id'],
                  label_columns=['nlp_matched_key', 'nlp_summary'],
-                 choice_column='nlp_review_rating'):
+                 choice_column='nlp_review_rating',
+                 text_column='text'):
 
         """
             convert absa data from csv to label-studio YM_ABSA format
@@ -36,11 +37,14 @@ class ABSALoader:
             [",", ".", "?", "!", ";", "~", "，", "？", "！", "；", "…"] if lang != "cn" else None
         )
         self.err_entries = []
+
         self.level_columns = level_columns
         self.keep_columns = keep_columns
         self.aspect_column = label_columns[0]
         self.opinion_column = label_columns[1]
         self.choice_column = choice_column
+        self.text_column = text_column
+
         self.visited = set()
         self.lang = lang
 
@@ -213,7 +217,7 @@ class ABSALoader:
     def load(self, item):
         """convert line of nlp csv to a label-studio absa task"""
         item = self._preprocess_item(item)
-        matcher = TokenMatcher(item['text'].lower(), clause_delimiter=self.clause_delimiter)
+        matcher = TokenMatcher(item[self.text_column].lower(), clause_delimiter=self.clause_delimiter)
 
         result, convert_result = self._load_item(item, matcher)
         if len(result) == 1:
@@ -241,8 +245,8 @@ class ABSALoader:
 
     def _prepare_data(self, item, tokens):
         data = {
-            'text': ' '.join(tokens) if self.lang == "cn" else item['text'],
-            'original_text': item['text'],
+            'text': ' '.join(tokens) if self.lang == "cn" else item[self.text_column],
+            'original_text': item[self.text_column],
             'nlp_level': '#'.join([item[level] for level in self.level_columns])
         }
 

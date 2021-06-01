@@ -10,6 +10,7 @@ import json
 import copy
 
 from ainlp.text_utils import TokenMatcher
+from ainlp import TextProcessor
 from loguru import logger
 
 from refo import search
@@ -20,8 +21,6 @@ from label_studio_converter.custom.utils import (
 
 
 class ABSALoader:
-    """"""
-
     def __init__(self,
                  lang="cn",
                  level_columns=['nlp_level_1', 'nlp_level_2'],
@@ -37,9 +36,10 @@ class ABSALoader:
             [",", ".", "?", "!", ";", "~", "，", "？", "！", "；", "…"] if lang != "cn" else None
         )
         self.err_entries = []
-
+        self.processor = TextProcessor()
         self.level_columns = level_columns
         self.keep_columns = keep_columns
+        self.label_columns = label_columns
         self.aspect_column = label_columns[0]
         self.opinion_column = label_columns[1]
         self.choice_column = choice_column
@@ -47,26 +47,27 @@ class ABSALoader:
 
         self.visited = set()
         self.lang = lang
+        self.matcher = None
 
-    def _gen_result(self, item, matcher):
-        """每条op只能生成0-1个情感摘要, 特征情感词不在同一个分句不生成, 如果有多条, 取特征情感词位置最接近的"""
-
+    def _gen_result(self, item):
+        """每条 op 只能生成 0-1个情感摘要, 特征情感词不在同一个分句不生成, 如果有多条, 取特征情感词位置最接近的"""
         result_item, convert_result_item = [], []
         for as_term in item[self.aspect_column]:
             # 为每一个特征词寻找最佳的情感摘要匹配, 如果一个都没有匹配到返回首个特征词的匹配
             found_matches = []
 
             for op_term in item[self.opinion_column]:
-                op_term = str(op_term)
-                # print(f'{as_term} | {op_term}')
 
-                m = matcher.search_co_occurance(
+                op_term = str(op_term)
+
+                m = self.matcher.search_co_occurance(
                     as_term.replace('  ', ' '), op_term.replace('  ', ' ')
                 )
+
                 if m:
                     aspect_tok_pos, op_tok_pos = m.group('kw1'), m.group('kw2')
-                    found_matches.append((m, abs(op_tok_pos[0] - aspect_tok_pos[0])))
 
+                    found_matches.append((m, abs(op_tok_pos[0] - aspect_tok_pos[0])))
             if len(found_matches) > 0:
                 m, _ = min(found_matches, key=lambda x: x[1])
                 cover_tok_pos, aspect_tok_pos, op_tok_pos = (
@@ -77,15 +78,15 @@ class ABSALoader:
                 # 只有特征词与情感词在一个分句则认为summary可以识别
                 tok_start, tok_end = cover_tok_pos[0], cover_tok_pos[1]
                 if (
-                        matcher.clause_index[aspect_tok_pos[0]]
-                        == matcher.clause_index[op_tok_pos[0]]
+                        self.matcher.clause_index[aspect_tok_pos[0]]
+                        == self.matcher.clause_index[op_tok_pos[0]]
                 ):
-                    tmp = matcher.pos_index[tok_start: tok_end + 1]
+                    tmp = self.matcher.pos_index[tok_start: tok_end + 1]
                     start, end = tmp[0], tmp[-1]
-                    shot_text = matcher.text[start:end]
+                    shot_text = self.matcher.text[start:end]
 
                     result_id = self._gen_id()
-                    r, cr = self._gen_aspect(matcher=matcher, tok_range=aspect_tok_pos)
+                    r, cr = self._gen_aspect(tok_range=aspect_tok_pos)
                     result_item.extend(r)
                     convert_result_item.extend(cr)
 
@@ -123,12 +124,11 @@ class ABSALoader:
         if len(result_item) == 0:
             # print('没有情感摘要{}:{}'.format(self.answer['question_id'], item['aspectSubtype']) )
             # 如果一个摘要都没有找到, 列出首个特征词的结果
-            return self._gen_aspect(kw=item[self.aspect_column][0],
-                                    matcher=matcher)
+            return self._gen_aspect(kw=item[self.aspect_column][0])
 
         return result_item, convert_result_item
 
-    def _gen_aspect(self, matcher, kw=None, tok_range=None):
+    def _gen_aspect(self, kw=None, tok_range=None):
         """
         根据特征词生成 yicrowds absa 标注格式 result item
         :param label_type:
@@ -137,7 +137,7 @@ class ABSALoader:
         :return:
         """
         if tok_range is None:
-            kw_range = matcher.search(kw.replace('  ', ' '))
+            kw_range = self.matcher.search(kw.replace('  ', ' '))
 
             if kw_range is None:
                 return [], []
@@ -146,9 +146,9 @@ class ABSALoader:
         else:
             tok_start, tok_end = tok_range
 
-        tmp = matcher.pos_index[tok_start: tok_end + 1]
+        tmp = self.matcher.pos_index[tok_start: tok_end + 1]
         start, end = tmp[0], tmp[-1]
-        shot_text = matcher.text[start:end]
+        shot_text = self.matcher.text[start:end]
 
         result_id = self._gen_id()
         result_item, convert_result_item = (
@@ -198,34 +198,58 @@ class ABSALoader:
 
         return [choice], [choice]
 
-    def _load_item(self, item, matcher):
+    def _load_item(self, item):
         result, convert_result = self._init_polar_result(item)
-
-        result_item, convert_result_item = self._gen_result(item, matcher)
+        result_item, convert_result_item = self._gen_result(item)
         convert_result.extend(convert_result_item)
         result.extend(result_item)
 
         return result, convert_result
 
+    def _fix_term(self, item):
+        m = TokenMatcher(item)
+        if len(m.tokens) > 10:
+            return ''.join(m.tokens[:5]) + ' ' + ''.join(m.tokens[-5:])
+        return item
+
     def _preprocess_item(self, item):
-        new_item = copy.deepcopy(item)
-        aspect_term, opinion_term = new_item[self.aspect_column], new_item[self.opinion_column]
-        new_item[self.aspect_column] = aspect_term.strip().split(',') if isinstance(aspect_term, str) else []
-        new_item[self.opinion_column] = opinion_term.strip().split(',') if isinstance(opinion_term, str) else []
+        # note: 当opinion_column字段值比较长, token 大于11, ainlp 引用的 pyrefo.findall 函数会报错, 暂时不知道原因
+        # 临时解决办法是 在预处理的时候进行检查如果发现比较长, 人工截断 (csk 20210601)
+
+        new_item = {}
+        aspect_term, opinion_term = item[self.aspect_column], item[self.opinion_column]
+        if self.lang == 'cn':
+            opinion_term = self._fix_term(opinion_term)
+            aspect_term = self._fix_term(aspect_term)
+
+        new_item[self.aspect_column] = aspect_term.strip().split(',') if isinstance(aspect_term, str) and len(
+            aspect_term) > 0 else []
+        new_item[self.opinion_column] = opinion_term.strip().split(',') if isinstance(opinion_term, str) and len(
+            opinion_term) > 0 else []
+
+        new_item[self.text_column] = self.processor.process(item[self.text_column.lower()])
+        new_item['nlp_level'] = '#'.join([item[level] for level in self.level_columns])
+
+        for column in [self.choice_column] + self.keep_columns:
+            new_item[column] = item[column]
         return new_item
+
+    def init_matcher(self, text):
+        del self.matcher
+        self.matcher = TokenMatcher(text, clause_delimiter=self.clause_delimiter)
 
     def load(self, item):
         """convert line of nlp csv to a label-studio absa task"""
         item = self._preprocess_item(item)
-        matcher = TokenMatcher(item[self.text_column].lower(), clause_delimiter=self.clause_delimiter)
+        self.init_matcher(item[self.text_column])
 
-        result, convert_result = self._load_item(item, matcher)
+        result, convert_result = self._load_item(item)
         if len(result) == 1:
             # 重新查找
             try:
-                has_error, new_item, reason = self._check_item(item, tokens=matcher.tokens)
+                has_error, new_item, reason = self._check_item(item, self.matcher.tokens)
                 if has_error and new_item is not None:
-                    result, convert_result = self._load_item(new_item, matcher)
+                    result, convert_result = self._load_item(new_item)
             except Exception as e:
                 logger.error(repr(e))
 
@@ -234,7 +258,7 @@ class ABSALoader:
 
         else:
             return True, {
-                'data': self._prepare_data(item, matcher.tokens),
+                'data': self._prepare_data(item),
                 'completions': [
                     {
                         'result': result,
@@ -243,11 +267,11 @@ class ABSALoader:
                 ],
             }
 
-    def _prepare_data(self, item, tokens):
+    def _prepare_data(self, item):
         data = {
-            'text': ' '.join(tokens) if self.lang == "cn" else item[self.text_column],
+            'text': ' '.join(self.matcher.tokens) if self.lang == "cn" else item[self.text_column],
             'original_text': item[self.text_column],
-            'nlp_level': '#'.join([item[level] for level in self.level_columns])
+            'nlp_level': item['nlp_level']
         }
 
         for col in self.keep_columns:

@@ -227,7 +227,8 @@ class ABSALoader:
         new_item[self.opinion_column] = opinion_term.strip().split(',') if isinstance(opinion_term, str) and len(
             opinion_term) > 0 else []
 
-        new_item[self.text_column] = self.processor.process(item[self.text_column.lower()])
+        new_item['raw_text'] = item[self.text_column]
+        new_item[self.text_column] = self.processor.process(item[self.text_column].lower())
         new_item['nlp_level'] = '#'.join([item[level] for level in self.level_columns])
 
         for column in [self.choice_column] + self.keep_columns:
@@ -271,6 +272,7 @@ class ABSALoader:
         data = {
             'text': ' '.join(self.matcher.tokens) if self.lang == "cn" else item[self.text_column],
             'original_text': item[self.text_column],
+            'raw_text': item['raw_text'],
             'nlp_level': item['nlp_level']
         }
 

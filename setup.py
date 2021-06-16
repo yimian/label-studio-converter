@@ -1,6 +1,6 @@
 import setuptools
 
-VERSION = '0.1.5'
+VERSION = '0.1.7'
 
 # Readme
 with open('README.md', 'r') as f:
